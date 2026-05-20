@@ -6,45 +6,34 @@
  *  - GET  /api/chamados/:idChamado/comentarios   lista comentarios
  *
  * Comentarios sao imutaveis (regra 5): nao existem endpoints de edicao
- * nem de exclusao.
+ * nem de exclusao. Nesta etapa, cada metodo apenas valida o formato da
+ * entrada (quando aplicavel) e responde HTTP 501.
  */
-import type { NextFunction, Request, Response } from "express";
+import type { Request, Response } from "express";
 import { z } from "zod";
-import type { IComentariosService } from "../services/IComentariosService";
-import { exigirUsuarioAutenticado } from "../lib/contexto";
 
 const esquemaComentario = z.object({
   texto: z.string().trim().min(1, "Comentario nao pode estar vazio."),
 });
 
 export class ComentariosController {
-  constructor(private readonly comentariosService: IComentariosService) {}
-
-  adicionar = async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const usuario = exigirUsuarioAutenticado(req);
-      const { texto } = esquemaComentario.parse(req.body);
-      const comentario = await this.comentariosService.adicionar(
-        usuario,
-        req.params.idChamado,
-        texto,
-      );
-      res.status(201).json(comentario);
-    } catch (erro) {
-      next(erro);
+  adicionar = async (req: Request, res: Response) => {
+    const resultado = esquemaComentario.safeParse(req.body);
+    if (!resultado.success) {
+      return res.status(400).json({
+        erro: "Dados invalidos.",
+        detalhes: resultado.error.issues.map((i) => ({
+          campo: i.path.join("."),
+          mensagem: i.message,
+        })),
+      });
     }
+    res
+      .status(501)
+      .json({ erro: "Service pendente: adicionar comentario." });
   };
 
-  listar = async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const usuario = exigirUsuarioAutenticado(req);
-      const comentarios = await this.comentariosService.listarPorChamado(
-        usuario,
-        req.params.idChamado,
-      );
-      res.status(200).json(comentarios);
-    } catch (erro) {
-      next(erro);
-    }
+  listar = async (_req: Request, res: Response) => {
+    res.status(501).json({ erro: "Service pendente: listar comentarios." });
   };
 }

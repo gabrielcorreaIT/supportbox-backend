@@ -1,95 +1,192 @@
 /**
- * Controller de chamados.
+ * Controller de chamados (tickets de suporte).
  *
- * Endpoints:
- *  - POST   /api/chamados                  abrir
- *  - GET    /api/chamados                  listar
- *  - GET    /api/chamados/:id              detalhar
- *  - POST   /api/chamados/:id/assumir      agente assume
- *  - POST   /api/chamados/:id/concluir     agente atribuido conclui
- *  - POST   /api/chamados/:id/reabrir      solicitante reabre (ate 7 dias)
- *  - PATCH  /api/chamados/:id/atribuir     reatribuir a outro agente
- *  - PATCH  /api/chamados/:id/prioridade   alterar prioridade
+ * Posicao na arquitetura: camada HTTP. Cada metodo aqui faz sempre o mesmo
+ * roteiro:
+ *   1. descobre quem esta agindo (`extrairAtor`) - se nao der, responde 401;
+ *   2. quando ha corpo, le e parseia o JSON (`lerCorpoJson`) - se for
+ *      invalido, responde 400;
+ *   3. delega para o `ChamadosService` (que aplica as regras e fala com a
+ *      DAO), dentro de um try/catch;
+ *   4. em caso de sucesso, responde com o resultado; em caso de erro de
+ *      regra, `responderErro` traduz para o status HTTP certo.
  *
- * Nesta etapa, cada metodo apenas valida o formato da entrada (com
- * zod, quando aplicavel) e responde HTTP 501. As regras de negocio
- * descritas em REGRAS_DE_NEGOCIO.md serao aplicadas pela camada de
- * Service na proxima etapa.
+ * O Controller NAO decide regra de negocio nem toca no banco - so traduz
+ * HTTP <-> Service.
+ *
+ * Endpoints (todos sob `/api/chamados`):
+ *  - POST   /                  abrir um chamado novo          -> 201
+ *  - GET    /                  listar chamados (com filtros)  -> 200
+ *  - GET    /:id               detalhar um chamado            -> 200
+ *  - POST   /:id/assumir       agente assume para si          -> 200
+ *  - POST   /:id/concluir      agente atribuido conclui       -> 200
+ *  - POST   /:id/reabrir       solicitante reabre (ate 7d)    -> 200
+ *  - PATCH  /:id/atribuir      reatribuir para outro agente   -> 200
+ *  - PATCH  /:id/prioridade    alterar prioridade             -> 200
  */
-import type { Request, Response } from "express";
-import { z, type ZodIssue } from "zod";
-
-const esquemaAbertura = z.object({
-  titulo: z.string().trim().min(5, "Titulo precisa ter ao menos 5 caracteres."),
-  descricao: z
-    .string()
-    .trim()
-    .min(20, "Descricao precisa ter ao menos 20 caracteres."),
-  categoria: z.enum(["hardware", "software", "acesso", "rede"]),
-  tipo: z.enum(["incidente", "solicitacao"]),
-});
-
-const esquemaListagem = z.object({
-  status: z.enum(["aberto", "em_andamento", "concluido"]).optional(),
-  busca: z.string().trim().optional(),
-});
-
-const esquemaPrioridade = z.object({
-  prioridade: z.enum(["baixa", "media", "alta"]),
-});
-
-const esquemaAtribuicao = z.object({
-  agenteId: z.string().min(1, "Identificador do agente obrigatorio."),
-});
-
-function responderInvalido(res: Response, issues: ZodIssue[]) {
-  return res.status(400).json({
-    erro: "Dados invalidos.",
-    detalhes: issues.map((i) => ({
-      campo: i.path.join("."),
-      mensagem: i.message,
-    })),
-  });
-}
+import type { IncomingMessage, ServerResponse } from "http";
+import { responder, responderErro, type Contexto } from "../utils/http";
+import { lerCorpoJson } from "../utils/corpo";
+import { extrairAtor } from "../utils/ator";
+import {
+  ChamadosService,
+  type DadosAbrirChamado,
+} from "../services/ChamadosService";
 
 export class ChamadosController {
-  abrir = async (req: Request, res: Response) => {
-    const r = esquemaAbertura.safeParse(req.body);
-    if (!r.success) return responderInvalido(res, r.error.issues);
-    res.status(501).json({ erro: "Service pendente: abrir chamado." });
+  private service = new ChamadosService();
+
+  /**
+   * POST /api/chamados - abre um chamado novo. Responde 201 com o chamado
+   * criado (ja com id, protocolo e datas), ou 400 se os dados forem
+   * invalidos.
+   */
+  abrir = async (req: IncomingMessage, res: ServerResponse) => {
+    const ator = extrairAtor(req);
+    if (!ator) return responder(res, 401, { erro: "Nao autenticado." });
+
+    const corpo = await lerCorpoJson<DadosAbrirChamado>(req);
+    if (!corpo.ok) return responder(res, 400, { erro: corpo.erro });
+
+    try {
+      const chamado = this.service.abrir(ator, corpo.dados);
+      responder(res, 201, chamado);
+    } catch (erro) {
+      responderErro(res, erro);
+    }
   };
 
-  listar = async (req: Request, res: Response) => {
-    const r = esquemaListagem.safeParse(req.query);
-    if (!r.success) return responderInvalido(res, r.error.issues);
-    res.status(501).json({ erro: "Service pendente: listar chamados." });
+  /**
+   * GET /api/chamados - lista os chamados visiveis para o ator, com filtro
+   * opcional `?status=`. Responde 200 com `{ itens: [...] }`.
+   */
+  listar = (req: IncomingMessage, res: ServerResponse, ctx: Contexto) => {
+    const ator = extrairAtor(req);
+    if (!ator) return responder(res, 401, { erro: "Nao autenticado." });
+
+    try {
+      const itens = this.service.listar(ator, { status: ctx.busca.status });
+      responder(res, 200, { itens });
+    } catch (erro) {
+      responderErro(res, erro);
+    }
   };
 
-  detalhar = async (_req: Request, res: Response) => {
-    res.status(501).json({ erro: "Service pendente: detalhar chamado." });
+  /**
+   * GET /api/chamados/:id - detalha um chamado. Responde 200 com o chamado,
+   * 403 se o ator nao puder ve-lo, ou 404 se nao existir.
+   */
+  detalhar = (req: IncomingMessage, res: ServerResponse, ctx: Contexto) => {
+    const ator = extrairAtor(req);
+    if (!ator) return responder(res, 401, { erro: "Nao autenticado." });
+
+    try {
+      const chamado = this.service.detalhar(ctx.parametros.id, ator);
+      responder(res, 200, chamado);
+    } catch (erro) {
+      responderErro(res, erro);
+    }
   };
 
-  assumir = async (_req: Request, res: Response) => {
-    res.status(501).json({ erro: "Service pendente: assumir chamado." });
+  /**
+   * POST /api/chamados/:id/assumir - agente assume o chamado. Responde 200
+   * com o chamado atualizado.
+   */
+  assumir = (req: IncomingMessage, res: ServerResponse, ctx: Contexto) => {
+    const ator = extrairAtor(req);
+    if (!ator) return responder(res, 401, { erro: "Nao autenticado." });
+
+    try {
+      const chamado = this.service.assumir(ctx.parametros.id, ator);
+      responder(res, 200, chamado);
+    } catch (erro) {
+      responderErro(res, erro);
+    }
   };
 
-  concluir = async (_req: Request, res: Response) => {
-    res.status(501).json({ erro: "Service pendente: concluir chamado." });
+  /**
+   * POST /api/chamados/:id/concluir - agente atribuido conclui o chamado.
+   * Responde 200 com o chamado atualizado.
+   */
+  concluir = (req: IncomingMessage, res: ServerResponse, ctx: Contexto) => {
+    const ator = extrairAtor(req);
+    if (!ator) return responder(res, 401, { erro: "Nao autenticado." });
+
+    try {
+      const chamado = this.service.concluir(ctx.parametros.id, ator);
+      responder(res, 200, chamado);
+    } catch (erro) {
+      responderErro(res, erro);
+    }
   };
 
-  reabrir = async (_req: Request, res: Response) => {
-    res.status(501).json({ erro: "Service pendente: reabrir chamado." });
+  /**
+   * POST /api/chamados/:id/reabrir - solicitante reabre o chamado (ate 7
+   * dias apos a conclusao). Responde 200 com o chamado atualizado.
+   */
+  reabrir = (req: IncomingMessage, res: ServerResponse, ctx: Contexto) => {
+    const ator = extrairAtor(req);
+    if (!ator) return responder(res, 401, { erro: "Nao autenticado." });
+
+    try {
+      const chamado = this.service.reabrir(ctx.parametros.id, ator);
+      responder(res, 200, chamado);
+    } catch (erro) {
+      responderErro(res, erro);
+    }
   };
 
-  reatribuir = async (req: Request, res: Response) => {
-    const r = esquemaAtribuicao.safeParse(req.body);
-    if (!r.success) return responderInvalido(res, r.error.issues);
-    res.status(501).json({ erro: "Service pendente: reatribuir chamado." });
+  /**
+   * PATCH /api/chamados/:id/atribuir - reatribui o chamado para outro
+   * agente. Body: `{ agenteId }`. Responde 200 com o chamado atualizado.
+   */
+  reatribuir = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    ctx: Contexto,
+  ) => {
+    const ator = extrairAtor(req);
+    if (!ator) return responder(res, 401, { erro: "Nao autenticado." });
+
+    const corpo = await lerCorpoJson<{ agenteId?: unknown }>(req);
+    if (!corpo.ok) return responder(res, 400, { erro: corpo.erro });
+
+    try {
+      const chamado = this.service.reatribuir(
+        ctx.parametros.id,
+        ator,
+        corpo.dados.agenteId,
+      );
+      responder(res, 200, chamado);
+    } catch (erro) {
+      responderErro(res, erro);
+    }
   };
 
-  alterarPrioridade = async (req: Request, res: Response) => {
-    const r = esquemaPrioridade.safeParse(req.body);
-    if (!r.success) return responderInvalido(res, r.error.issues);
-    res.status(501).json({ erro: "Service pendente: alterar prioridade." });
+  /**
+   * PATCH /api/chamados/:id/prioridade - altera a prioridade. Body:
+   * `{ prioridade }` em baixa|media|alta. Responde 200 com o chamado.
+   */
+  alterarPrioridade = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    ctx: Contexto,
+  ) => {
+    const ator = extrairAtor(req);
+    if (!ator) return responder(res, 401, { erro: "Nao autenticado." });
+
+    const corpo = await lerCorpoJson<{ prioridade?: unknown }>(req);
+    if (!corpo.ok) return responder(res, 400, { erro: corpo.erro });
+
+    try {
+      const chamado = this.service.alterarPrioridade(
+        ctx.parametros.id,
+        ator,
+        corpo.dados.prioridade,
+      );
+      responder(res, 200, chamado);
+    } catch (erro) {
+      responderErro(res, erro);
+    }
   };
 }
